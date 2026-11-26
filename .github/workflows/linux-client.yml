@@ -1,0 +1,55 @@
+name: Linux x86_64 client
+
+on:
+  push:
+    branches: [ssh-fish-image-paste]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.97.0
+
+      - name: Restore Rust dependencies
+        id: rust_cache
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: linux-x86_64-client-release
+
+      - uses: ./.github/actions/install-linux-deps
+        with:
+          extra_packages: 'libudev-dev'
+
+      - name: Build client
+        run: cargo build --locked --release -p oxideterm-gpui-app --bin oxideterm-native
+
+      - name: Record binary checksum
+        working-directory: target/release
+        run: |
+          sha256sum oxideterm-native | tee oxideterm-native.sha256
+          cat oxideterm-native.sha256 >> "$GITHUB_STEP_SUMMARY"
+          echo 'Rust cache exact match: ${{ steps.rust_cache.outputs.cache-hit }}' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Linux client
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oxideterm-native-linux-x86_64
+          path: |
+            target/release/oxideterm-native
+            target/release/oxideterm-native.sha256
+          if-no-files-found: error
