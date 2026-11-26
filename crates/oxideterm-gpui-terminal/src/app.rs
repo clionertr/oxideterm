@@ -195,6 +195,7 @@ pub enum TerminalPaneEvent {
     TriggerInteractionRequested,
     // Dropped OS paths stay pane-owned until Workspace routes them to SFTP.
     ExternalPathsDropped,
+    PasteSshImage(Arc<gpui::Image>),
     // Search completion is asynchronous; Workspace reads the latest pane-owned status.
     SearchStatusChanged,
     // The pane retains the hovered value; Workspace owns tooltip timing and placement.
@@ -3166,7 +3167,7 @@ impl TerminalPane {
         }
     }
 
-    fn paste_text_without_broadcast(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+    pub fn paste_text_without_broadcast(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         if !self.terminal_accepts_input() {
             return false;
         }
@@ -3743,7 +3744,13 @@ impl TerminalPane {
         if self.paste_editor.is_some() {
             return;
         }
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        if self.request_ssh_image_paste(&item, cx) {
+            return;
+        }
+        let Some(text) = item.text() else {
             return;
         };
         if text.is_empty() {
@@ -3760,6 +3767,17 @@ impl TerminalPane {
             self.send_user_protocol_bytes(prefix, cx);
         }
         self.paste_text(&text, cx);
+    }
+
+    fn request_ssh_image_paste(&self, item: &ClipboardItem, cx: &mut Context<Self>) -> bool {
+        if self.session_kind != TerminalSessionKind::SshPty || !self.terminal_accepts_input() {
+            return false;
+        }
+        let Some(gpui::ClipboardEntry::Image(image)) = item.entries().first() else {
+            return false;
+        };
+        cx.emit(TerminalPaneEvent::PasteSshImage(Arc::new(image.clone())));
+        true
     }
 
     fn resolve_kitty_file_transmission(
@@ -6443,6 +6461,39 @@ mod tests {
             assert_eq!(pane.theme.background, light.background);
             assert_eq!(pane.theme.tokens.terminal.red, light.tokens.terminal.red);
         });
+    }
+
+    #[gpui::test]
+    fn ssh_image_paste_routes_image_bytes_only_from_the_ssh_pane(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_window, _cx| TerminalTestRoot);
+        let pane = cx.update(|window, cx| {
+            cx.new(|cx| TerminalPane::new_recording_playback(
+                DEFAULT_COLS, DEFAULT_ROWS, TerminalUiPreferences::default(), window, cx,
+            ).unwrap())
+        });
+        let received = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let images = received.clone();
+        let _subscription = cx.update(|_, cx| cx.subscribe(&pane, move |_, event, _| {
+            if let TerminalPaneEvent::PasteSshImage(image) = event {
+                images.borrow_mut().push((image.format, image.bytes.clone()));
+            }
+        }));
+        pane.update(cx, |pane, cx| {
+            pane.test_accepts_input = true;
+            let image = gpui::Image { format: gpui::ImageFormat::Png, bytes: vec![137, 80, 78, 71], id: 1 };
+            cx.write_to_clipboard(ClipboardItem::new_image(&image));
+            pane.session_kind = TerminalSessionKind::LocalPty;
+            pane.paste_from_clipboard(cx);
+            pane.session_kind = TerminalSessionKind::SshPty;
+            pane.paste_from_clipboard(cx);
+            pane.handle_key(&gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("ctrl-v").unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            }, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(*received.borrow(), vec![(gpui::ImageFormat::Png, vec![137, 80, 78, 71]); 2]);
     }
 
     #[gpui::test]

@@ -46,6 +46,39 @@ fn configure_sftp_external_bridge(command: &mut std::process::Command) {
 }
 
 impl WorkspaceApp {
+    pub(in crate::workspace) fn paste_ssh_clipboard_image(
+        &mut self,
+        pane_id: PaneId,
+        session_id: TerminalSessionId,
+        image: Arc<gpui::Image>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node) = self.workspace_runtime.read(cx).ssh_terminal_node_id(session_id) else {
+            return;
+        };
+        let Some(backend) = self.sftp_remote_backend(&SftpRemoteId::Node(node)) else {
+            self.push_sftp_toast(self.i18n.t("sftp.toast.upload_failed"), None, TerminalNoticeVariant::Error, cx);
+            return;
+        };
+        let upload = self.forwarding_runtime.spawn(async move {
+            let session = backend.acquire_transfer_sftp().await?;
+            session.write_clipboard_image(image.format.extension(), &image.bytes).await.map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |workspace, cx| {
+            let result = upload.await.map_err(|error| error.to_string()).and_then(|result| result);
+            let _ = workspace.update(cx, |workspace, cx| match result {
+                Ok(path) => {
+                    if workspace.session_id_for_pane(pane_id, cx) == Some(session_id)
+                        && let Some(pane) = workspace.tab_host.read(cx).panes().get(&pane_id).cloned()
+                    {
+                        pane.update(cx, |pane, cx| pane.paste_text_without_broadcast(&path, cx));
+                    }
+                }
+                Err(error) => workspace.push_sftp_toast(workspace.i18n.t("sftp.toast.upload_failed"), Some(error), TerminalNoticeVariant::Error, cx),
+            });
+        }).detach();
+    }
+
     pub(in crate::workspace::sftp) fn browse_sftp_upload_files(&mut self, cx: &mut Context<Self>) {
         let Some(node_id) = self.visible_sftp_node_id(cx) else {
             return;

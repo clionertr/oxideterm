@@ -626,7 +626,7 @@ fn build_sample_command_with_system_info(
         commands.push(docker_sample_command(os_type).to_string());
     }
     commands.push("echo '===END==='".to_string());
-    format!("{}\n", commands.join("; "))
+    format!("{}\n", crate::shell::posix_shell_command(&commands.join("; ")))
 }
 
 // Total CPU rate from the raw PerfOS counters. `Win32_Processor.LoadPercentage`
@@ -1222,6 +1222,25 @@ mod tests {
         assert_eq!(registry.current("conn-1"), None);
         assert_eq!(registry.trend_history("conn-1"), Vec::new());
         assert!(registry.connection_ids().is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires fish and iproute2 on a Linux host"]
+    fn fish_runs_port_and_recurring_resource_probes() {
+        let ports = crate::build_port_snapshot_command("Linux").command;
+        let sample = build_live_sample_command("Linux", ResourceSamplingConfig {
+            system: true, gpu: false, processes: false, docker: true,
+        });
+        let output = std::process::Command::new("fish")
+            .args(["--no-config", "-c", &format!("{ports}\n{sample}{sample}")])
+            .output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.lines().any(|line| line == "__OXIDE_PORT_CAPABILITY__\tfull\tlinux_ss"));
+        assert!(stdout.lines().any(|line| line == "===PORTS_END==="));
+        assert_eq!(stdout.lines().filter(|line| *line == "===DOCKER_END===").count(), 2);
+        assert_eq!(stdout.lines().filter(|line| *line == "===END===").count(), 2);
     }
 
     #[test]

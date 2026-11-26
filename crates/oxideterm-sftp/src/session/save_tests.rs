@@ -411,6 +411,15 @@ async fn openssh_preserves_raw_names_and_atomically_replaces_the_selected_file()
         home: directory.path().to_str().unwrap().into(),
         cwd: directory.path().to_str().unwrap().into(),
     };
+    let image = b"\x89PNG\r\n\x1a\n\x00\xff";
+    let image_path = session.write_clipboard_image("png", image).await.unwrap();
+    let saved = std::fs::read(&image_path).unwrap();
+    let permissions = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(&image_path).unwrap().permissions(),
+    );
+    session.delete(&image_path).await.unwrap();
+    assert_eq!(saved, image);
+    assert_eq!(permissions & 0o777, 0o600);
     let entries = session.list_dir("", None).await.unwrap();
     assert_eq!(
         entries.iter().filter(|file| file.name == "�.log").count(),

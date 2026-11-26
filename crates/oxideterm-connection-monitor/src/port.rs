@@ -79,15 +79,15 @@ pub fn build_port_snapshot_command(os_type: &str) -> PortCaptureCommand {
             PortCommandCapability::Partial,
         ),
         PortOs::MacOs => (
-            build_macos_port_snapshot_command(),
+            crate::shell::posix_shell_command(&build_macos_port_snapshot_command()),
             PortCommandCapability::Partial,
         ),
         PortOs::Bsd => (
-            build_bsd_port_snapshot_command(),
+            crate::shell::posix_shell_command(&build_bsd_port_snapshot_command()),
             PortCommandCapability::Partial,
         ),
         PortOs::Linux | PortOs::Unknown => (
-            build_linux_port_snapshot_command(),
+            crate::shell::posix_shell_command(&build_linux_port_snapshot_command()),
             PortCommandCapability::Full,
         ),
     };

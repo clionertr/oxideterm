@@ -11,7 +11,7 @@ use gpui::{
 use oxideterm_settings::TerminalRightClickAction;
 use oxideterm_terminal::{
     TermMode, TerminalEditorApplication, TerminalEditorClipboardOperation, TerminalRow,
-    TerminalSearchMatch, TerminalSnapshot,
+    TerminalSearchMatch, TerminalSessionKind, TerminalSnapshot,
 };
 use oxideterm_terminal_unicode::visual_line_for_row;
 use unicode_segmentation::UnicodeSegmentation;
@@ -231,6 +231,18 @@ impl TerminalPane {
             self.win32_pressed_keys.clear();
         }
         if self.handle_editor_free_type_clipboard_shortcut(event, mode, cx) {
+            return true;
+        }
+        if self.session_kind == TerminalSessionKind::SshPty
+            && key.eq_ignore_ascii_case("v")
+            && modifiers.control
+            && !modifiers.shift
+            && !modifiers.alt
+            && !modifiers.platform
+            && configured.is_none()
+            && let Some(item) = cx.read_from_clipboard()
+            && self.request_ssh_image_paste(&item, cx)
+        {
             return true;
         }
         if self.handle_free_type_clipboard_shortcut(event, mode, cx) {

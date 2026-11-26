@@ -342,6 +342,36 @@ impl SftpSession {
         self.write_content_checked(path, content, None).await
     }
 
+    pub async fn write_clipboard_image(
+        &self,
+        extension: &str,
+        content: &[u8],
+    ) -> Result<String, SftpError> {
+        let name = format!("oxideterm-clipboard-{}.{}", uuid::Uuid::new_v4().simple(), extension);
+        validate_remote_entry_name(&name)?;
+        let path = format!("/tmp/{name}");
+        let audit = self.audit_operation("file_transfer", &path);
+        let result = async {
+            let mut file = self.sftp
+                .open_with_flags_and_attributes(
+                    &path,
+                    OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                    FileAttributes { permissions: Some(0o600), ..FileAttributes::empty() },
+                )
+                .await
+                .map_err(|error| self.map_sftp_error(error, &path))?;
+            let written = file.write_all(content).await;
+            let closed = file.close().await;
+            if let Err(error) = written.and(closed) {
+                let _ = self.sftp.remove_file(&path).await;
+                return Err(SftpError::IoError(error));
+            }
+            Ok(content.len() as u64)
+        }.await;
+        finish_sftp_file_transfer_audit(audit, &result);
+        result.map(|_| path)
+    }
+
     /// Replaces a user configuration file without following-path or metadata loss.
     pub async fn replace_config_content(
         &self,

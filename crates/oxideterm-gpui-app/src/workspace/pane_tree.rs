@@ -359,6 +359,9 @@ impl WorkspaceApp {
                 let paths = pane.update(cx, |pane, _cx| pane.take_dropped_external_paths());
                 self.handle_sftp_terminal_drop(pane_id, session_id, paths, cx);
             }
+            TerminalPaneEvent::PasteSshImage(image) => {
+                self.paste_ssh_clipboard_image(pane_id, session_id, image, cx);
+            }
             TerminalPaneEvent::CurrentDirectoryChanged => {
                 if self.active_pane_id(cx) == Some(pane_id) {
                     self.sync_active_terminal_metadata_context(cx);
