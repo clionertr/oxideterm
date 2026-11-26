@@ -33,7 +33,16 @@ jobs:
 
       - uses: ./.github/actions/install-linux-deps
         with:
-          extra_packages: 'libudev-dev'
+          extra_packages: 'libudev-dev fish'
+
+      - name: Run Fish compatibility tests
+        run: |
+          cargo test --locked --release -p oxideterm-connection-monitor
+          cargo test --locked --release -p oxideterm-forwarding
+          cargo test --locked --release -p oxideterm-environment
+          cargo test --locked --release -p oxideterm-ssh --lib monitor
+          cargo test --locked --release -p oxideterm-plugin-host-api host_tools
+          cargo test --locked --release -p oxideterm-public-mcp-host host_tools
 
       - name: Build client
         run: cargo build --locked --release -p oxideterm-gpui-app --bin oxideterm-native

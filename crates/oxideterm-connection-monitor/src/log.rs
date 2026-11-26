@@ -248,7 +248,7 @@ fn build_linux_log_snapshot_command(preset: LogPreset, limit: usize) -> String {
     } else {
         format!(" | grep -E -i {}", shell_quote(grep_filter))
     };
-    format!(
+    posix_shell_command(&format!(
         concat!(
             "echo '===HOST_LOGS==='; ",
             "if command -v journalctl >/dev/null 2>&1; then ",
@@ -281,15 +281,15 @@ fn build_linux_log_snapshot_command(preset: LogPreset, limit: usize) -> String {
         limit = limit,
         file_candidates = file_candidates,
         file_filter = file_filter,
-    )
+    ))
 }
 
 fn build_linux_log_follow_command(preset: LogPreset) -> String {
     let journal_args = linux_journalctl_preset_args(preset);
     let file_candidates = linux_log_file_candidates(preset).join(" ");
-    format!(
+    posix_shell_command(&format!(
         "if command -v journalctl >/dev/null 2>&1; then journalctl {journal_args} -f --no-pager; else tail -f {file_candidates}; fi"
-    )
+    ))
 }
 
 fn build_macos_log_snapshot_command(preset: LogPreset, limit: usize) -> String {
@@ -313,7 +313,7 @@ fn build_macos_log_snapshot_command(preset: LogPreset, limit: usize) -> String {
 
 fn build_macos_log_follow_command(preset: LogPreset) -> String {
     let predicate = macos_log_predicate(preset);
-    format!("log stream --style compact {predicate}")
+    posix_shell_command(&format!("log stream --style compact {predicate}"))
 }
 
 fn build_bsd_log_snapshot_command(preset: LogPreset, limit: usize) -> String {
@@ -323,7 +323,7 @@ fn build_bsd_log_snapshot_command(preset: LogPreset, limit: usize) -> String {
     } else {
         format!(" | grep -E -i {}", shell_quote(grep_filter))
     };
-    format!(
+    posix_shell_command(&format!(
         concat!(
             "echo '===HOST_LOGS==='; ",
             "if [ -r /var/log/messages ]; then ",
@@ -334,18 +334,18 @@ fn build_bsd_log_snapshot_command(preset: LogPreset, limit: usize) -> String {
         ),
         limit = limit,
         file_filter = file_filter,
-    )
+    ))
 }
 
 fn build_bsd_log_follow_command(preset: LogPreset) -> String {
     let grep_filter = bsd_log_grep_filter(preset);
     if grep_filter.is_empty() {
-        "tail -f /var/log/messages".to_string()
+        posix_shell_command("tail -f /var/log/messages")
     } else {
-        format!(
+        posix_shell_command(&format!(
             "tail -f /var/log/messages | grep --line-buffered -E -i {}",
             shell_quote(grep_filter)
-        )
+        ))
     }
 }
 
@@ -970,48 +970,81 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn journal_field_selection_preserves_entries_on_new_and_old_hosts() {
-        let fixture = r#"journalctl() {
-            if [ "$1" = --help ]; then printf '%s\n' "$JOURNAL_HELP"; return; fi
-            fields=''; for arg; do case "$arg" in --output-fields=*) fields=$arg;; esac; done
-            [ "$fields" = "$EXPECTED_FIELDS" ] || return 1
-            printf '%s\n' '{"MESSAGE":"service started","PRIORITY":"6","_COMM":"worker","UNIT":"worker.service","_SOURCE_REALTIME_TIMESTAMP":"123456"}'
-        }; "#;
+        use std::os::unix::fs::PermissionsExt;
+        let stub_dir = std::env::temp_dir().join(format!("oxide-log-stub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&stub_dir);
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        let stub = stub_dir.join("journalctl");
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+if [ "$1" = --help ]; then printf '%s\n' "$JOURNAL_HELP"; exit 0; fi
+fields=''; for arg; do case "$arg" in --output-fields=*) fields=$arg;; esac; done
+[ "$fields" = "$EXPECTED_FIELDS" ] || exit 1
+printf '%s\n' '{"MESSAGE":"service started","PRIORITY":"6","_COMM":"worker","UNIT":"worker.service","_SOURCE_REALTIME_TIMESTAMP":"123456"}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            stub_dir.display(),
+            std::env::var_os("PATH")
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
         let command = build_log_snapshot_command("Linux", LogPreset::All, 300).unwrap();
-        for supported in [true, false] {
-            let expected = if supported {
-                "--output-fields=MESSAGE,PRIORITY,SYSLOG_IDENTIFIER,_COMM,_TRANSPORT,_SYSTEMD_UNIT,UNIT,__REALTIME_TIMESTAMP,_SOURCE_REALTIME_TIMESTAMP,__MONOTONIC_TIMESTAMP"
-            } else {
-                ""
-            };
-            let output = std::process::Command::new("sh")
-                .args(["-c", &format!("{fixture}{}", command.command)])
-                .env(
-                    "JOURNAL_HELP",
-                    if supported {
-                        "--output-fields=LIST"
-                    } else {
-                        "--output=MODE"
-                    },
-                )
-                .env("EXPECTED_FIELDS", expected)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let snapshot = parse_log_snapshot(&String::from_utf8(output.stdout).unwrap());
-            assert_eq!(
-                snapshot.entries,
-                vec![ResourceLogEntry {
-                    timestamp: "123456".into(),
-                    level: "info".into(),
-                    source: "worker".into(),
-                    unit: "worker.service".into(),
-                    message: "service started".into(),
-                }]
-            );
+        for shell in ["/bin/sh", "fish"] {
+            for supported in [true, false] {
+                let expected = if supported {
+                    "--output-fields=MESSAGE,PRIORITY,SYSLOG_IDENTIFIER,_COMM,_TRANSPORT,_SYSTEMD_UNIT,UNIT,__REALTIME_TIMESTAMP,_SOURCE_REALTIME_TIMESTAMP,__MONOTONIC_TIMESTAMP"
+                } else {
+                    ""
+                };
+                let mut process = std::process::Command::new(shell);
+                if shell == "fish" {
+                    process.arg("--no-config");
+                }
+                let output = match process
+                    .args(["-c", &command.command])
+                    .env("PATH", &path)
+                    .env(
+                        "JOURNAL_HELP",
+                        if supported {
+                            "--output-fields=LIST"
+                        } else {
+                            "--output=MODE"
+                        },
+                    )
+                    .env("EXPECTED_FIELDS", expected)
+                    .output()
+                {
+                    Err(error)
+                        if shell == "fish" && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        break;
+                    }
+                    result => result.unwrap(),
+                };
+                assert!(
+                    output.status.success(),
+                    "{shell}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let snapshot = parse_log_snapshot(&String::from_utf8(output.stdout).unwrap());
+                assert_eq!(
+                    snapshot.entries,
+                    vec![ResourceLogEntry {
+                        timestamp: "123456".into(),
+                        level: "info".into(),
+                        source: "worker".into(),
+                        unit: "worker.service".into(),
+                        message: "service started".into(),
+                    }],
+                    "{shell}"
+                );
+            }
         }
+        let _ = std::fs::remove_dir_all(&stub_dir);
     }
 }

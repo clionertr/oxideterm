@@ -1,7 +1,7 @@
 // Copyright (C) 2026 OxideTerm contributors.
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::shell::shell_quote;
+use crate::shell::{encoded_posix_shell_command, shell_quote};
 
 pub const SHELL_PROBE_SENTINEL: &str = "OXIDETERM_GIT_PROBE_V1";
 pub const SHELL_BRANCH_LIST_SENTINEL: &str = "OXIDETERM_GIT_BRANCH_LIST_V1";
@@ -50,30 +50,30 @@ pub fn git_staged_diff_patch_args() -> GitProbeCommandArgs {
 /// The protocol uses NUL-separated records so paths and branch names containing
 /// tabs or spaces do not need ad-hoc escaping in the parser.
 pub fn remote_shell_probe_command(cwd: &str) -> String {
-    format!(
+    encoded_posix_shell_command(&format!(
         "{}{}{}",
         remote_shell_cd_prelude(cwd, SHELL_PROBE_SENTINEL),
         shell_operation_probe_body(),
         shell_probe_body(),
-    )
+    ))
 }
 
 /// Build a POSIX shell command that lists local branches and linked worktrees remotely.
 pub fn remote_shell_branch_list_command(cwd: &str) -> String {
-    format!(
+    encoded_posix_shell_command(&format!(
         "{}{}",
         remote_shell_cd_prelude(cwd, SHELL_BRANCH_LIST_SENTINEL),
         shell_branch_list_body(),
-    )
+    ))
 }
 
 /// Build a POSIX shell command that captures staged diff content remotely.
 pub fn remote_shell_staged_diff_command(cwd: &str) -> String {
-    format!(
+    encoded_posix_shell_command(&format!(
         "{}{}",
         remote_shell_cd_prelude(cwd, SHELL_STAGED_DIFF_SENTINEL),
         shell_staged_diff_body(),
-    )
+    ))
 }
 
 fn remote_shell_cd_prelude(cwd: &str, sentinel: &str) -> String {
@@ -191,7 +191,7 @@ mod tests {
             ("/tmp/it's-ok", "cd -- '/tmp/it'\\''s-ok'"),
             ("~/project dir", "cd -- \"$HOME\"/'project dir'"),
         ] {
-            let command = remote_shell_probe_command(cwd);
+            let command = crate::shell::decoded_posix_script(&remote_shell_probe_command(cwd));
             assert!(command.contains(quoted), "{cwd}");
             assert!(command.contains(SHELL_PROBE_SENTINEL));
             assert!(command.contains("GIT_OPTIONAL_LOCKS=0"));
@@ -202,7 +202,8 @@ mod tests {
 
     #[test]
     fn remote_branch_list_command_quotes_cwd() {
-        let list = remote_shell_branch_list_command("/tmp/project");
+        let list =
+            crate::shell::decoded_posix_script(&remote_shell_branch_list_command("/tmp/project"));
         assert!(list.contains(SHELL_BRANCH_LIST_SENTINEL));
         assert!(list.contains("git branch --format='%(HEAD)%09%(refname:short)'"));
         assert!(list.contains("git worktree list --porcelain"));
@@ -213,10 +214,96 @@ mod tests {
 
     #[test]
     fn remote_staged_diff_command_quotes_cwd_and_emits_sentinel() {
-        let command = remote_shell_staged_diff_command("/tmp/Oxide Term");
+        let command = crate::shell::decoded_posix_script(&remote_shell_staged_diff_command(
+            "/tmp/Oxide Term",
+        ));
         assert!(command.contains("cd -- '/tmp/Oxide Term'"));
         assert!(command.contains(SHELL_STAGED_DIFF_SENTINEL));
         assert!(command.contains("git diff --cached --stat --"));
         assert!(command.contains("git diff --cached --patch --no-ext-diff --"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_shell_probe_runs_under_sh_and_fish_login_shells() {
+        use super::super::model::{GitBranchIdentity, GitProbeOutcome};
+        use super::super::parse::parse_shell_probe_output;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct TempRoot(std::path::PathBuf);
+        impl Drop for TempRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = TempRoot(
+            std::env::temp_dir().join(format!("oxideterm-git-fish-stub-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&root.0);
+        let bin_dir = root.0.join("bin");
+        let repo_dir = root.0.join(r"it's \repo");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let canonical_repo = std::fs::canonicalize(&repo_dir).unwrap();
+        let repo_str = canonical_repo.to_string_lossy().into_owned();
+
+        let git_stub = bin_dir.join("git");
+        std::fs::write(
+            &git_stub,
+            r#"#!/bin/sh
+case "$1" in
+  rev-parse)
+    case "$2" in
+      --show-toplevel) pwd -P; exit 0 ;;
+      --short) printf 'abc1234\n'; exit 0 ;;
+      --git-path) printf '/nonexistent/%s\n' "$3"; exit 0 ;;
+    esac
+    ;;
+  symbolic-ref) printf 'main\n'; exit 0 ;;
+  status) printf '# branch.head main\n'; exit 0 ;;
+esac
+exit 1
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&git_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var_os("PATH")
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        let command = remote_shell_probe_command(&repo_str);
+
+        for shell in ["/bin/sh", "fish"] {
+            let mut process = std::process::Command::new(shell);
+            if shell == "fish" {
+                process.arg("--no-config");
+            }
+            let output = match process.args(["-c", &command]).env("PATH", &path).output() {
+                Err(error) if shell == "fish" && error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                result => result.unwrap(),
+            };
+            assert!(
+                output.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let GitProbeOutcome::Ready(snapshot) = parse_shell_probe_output(&stdout) else {
+                panic!("{shell}: unexpected probe output: {stdout:?}");
+            };
+            assert_eq!(snapshot.repo_root, repo_str, "{shell}");
+            assert_eq!(
+                snapshot.branch,
+                GitBranchIdentity::Branch("main".to_string()),
+                "{shell}"
+            );
+        }
     }
 }

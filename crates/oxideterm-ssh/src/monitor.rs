@@ -56,15 +56,18 @@ impl ResourceSampler for DedicatedNodeResourceSampler {
                     .map_err(|error| error.to_string())?,
             );
             let connection = lease.handle().clone();
+            // Fish buffers non-PTY stdin until EOF, so a dedicated single-channel
+            // sampler must request a PTY instead of hanging on the first sample.
+            let with_pty = remote_shell_buffers_non_pty_input(&connection);
             match connection
-                .open_sampling_shell_channel(init_command, false, timeout)
+                .open_sampling_shell_channel(init_command, with_pty, timeout)
                 .await
             {
                 Ok(shell) => Ok(Box::new(SshResourceSampleShell {
                     shell,
                     fallback: None,
                     init_command: init_command.to_owned(),
-                    pty_attempted: false,
+                    pty_attempted: with_pty,
                     _connection_owner: Some(lease),
                 }) as Box<dyn ResourceSampleShell>),
                 Err(_) => Ok(Box::new(SshExecResourceSampleShell {
@@ -83,6 +86,14 @@ impl ResourceSampler for SshConnectionHandle {
         timeout: Duration,
     ) -> ResourceSamplerFuture<'a, Result<Box<dyn ResourceSampleShell>, String>> {
         Box::pin(async move {
+            // Avoid Fish's non-PTY stdin buffering and PTY startup prompt noise
+            // by sampling directly over one-shot exec on shared connections.
+            if remote_shell_buffers_non_pty_input(self) {
+                return Ok(Box::new(SshExecResourceSampleShell {
+                    connection: self.clone(),
+                    _connection_owner: None,
+                }) as Box<dyn ResourceSampleShell>);
+            }
             match self
                 .open_sampling_shell_channel(init_command, false, timeout)
                 .await
@@ -239,4 +250,42 @@ async fn sample_exec(
         ));
     }
     Ok(output.stdout)
+}
+
+fn remote_shell_name_buffers_non_pty_input(shell: Option<&str>) -> bool {
+    shell.is_some_and(|shell| {
+        shell
+            .trim()
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("fish"))
+    })
+}
+
+fn remote_shell_buffers_non_pty_input(connection: &SshConnectionHandle) -> bool {
+    let env = connection.remote_env();
+    remote_shell_name_buffers_non_pty_input(env.as_ref().and_then(|info| info.shell.as_deref()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_shell_name_buffers_non_pty_input;
+
+    #[test]
+    fn fish_login_shell_detection_matches_only_fish_executables() {
+        for (shell, expected) in [
+            (Some("/usr/bin/fish"), true),
+            (Some("/opt/homebrew/bin/fish"), true),
+            (Some("FISH"), true),
+            (Some("/bin/bash"), false),
+            (Some("/bin/zsh"), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                remote_shell_name_buffers_non_pty_input(shell),
+                expected,
+                "{shell:?}"
+            );
+        }
+    }
 }

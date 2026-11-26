@@ -15,28 +15,28 @@ pub const REMOTE_OS_PROBE_UNIX: &str = "echo '===DETECT==='; uname -s; echo '===
 pub const REMOTE_OS_PROBE_WINDOWS: &str = "powershell -NoProfile -Command \"Write-Output '===DETECT==='; Write-Output ('PLATFORM=' + [System.Environment]::OSVersion.Platform); Write-Output ('OS=' + [System.Environment]::OSVersion.VersionString); Write-Output '===END==='\"";
 
 pub const PORT_SCAN_COMMAND_LINUX: &str = concat!(
-    "echo '===PORTS==='; ",
-    "((ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep -i listen || true); ",
-    "echo '===PORTS_END==='; ",
-    "echo '===DOCKER==='; ",
-    "((docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' 2>/dev/null || sudo -n docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' 2>/dev/null) || true); ",
-    "echo '===DOCKER_END==='; ",
-    "echo '===END==='"
+    "/bin/sh -c 'echo ===PORTS===; ",
+    "(ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep -i listen || true; ",
+    "echo ===PORTS_END===; ",
+    "echo ===DOCKER===; ",
+    "docker ps --format \"{{.ID}}\t{{.Names}}\t{{.Ports}}\" 2>/dev/null || sudo -n docker ps --format \"{{.ID}}\t{{.Names}}\t{{.Ports}}\" 2>/dev/null || true; ",
+    "echo ===DOCKER_END===; ",
+    "echo ===END==='"
 );
 
 pub const PORT_SCAN_COMMAND_MACOS: &str = concat!(
-    "echo '===PORTS==='; ",
-    "((lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | tail -n +2) || true); ",
-    "echo '===PORTS_END==='; ",
-    "echo '===DOCKER==='; ",
-    "((docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' 2>/dev/null || sudo -n docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' 2>/dev/null) || true); ",
-    "echo '===DOCKER_END==='; ",
-    "echo '===END==='"
+    "/bin/sh -c 'echo ===PORTS===; ",
+    "lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | tail -n +2 || true; ",
+    "echo ===PORTS_END===; ",
+    "echo ===DOCKER===; ",
+    "docker ps --format \"{{.ID}}\t{{.Names}}\t{{.Ports}}\" 2>/dev/null || sudo -n docker ps --format \"{{.ID}}\t{{.Names}}\t{{.Ports}}\" 2>/dev/null || true; ",
+    "echo ===DOCKER_END===; ",
+    "echo ===END==='"
 );
 
 pub const PORT_SCAN_COMMAND_WINDOWS: &str = "echo '===PORTS==='; powershell -NoProfile -Command \"Get-NetTCPConnection -State Listen 2>$null | Select-Object LocalAddress,LocalPort,OwningProcess | Format-Table -HideTableHeaders\" 2>/dev/null; echo '===PORTS_END==='; echo '===END==='";
 
-pub const PORT_SCAN_COMMAND_FREEBSD: &str = "echo '===PORTS==='; sockstat -4 -6 -l -P tcp 2>/dev/null | tail -n +2; echo '===PORTS_END==='; echo '===END==='";
+pub const PORT_SCAN_COMMAND_FREEBSD: &str = "/bin/sh -c 'echo ===PORTS===; sockstat -4 -6 -l -P tcp 2>/dev/null | tail -n +2; echo ===PORTS_END===; echo ===END==='";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemotePortScanPlatform {
@@ -547,5 +547,88 @@ abc\tweb\t0.0.0.0:3000->3000/tcp, :::3000->3000/tcp
         assert!(ignored.new_ports.is_empty());
         assert_eq!(ignored.closed_ports.len(), 1);
         assert_eq!(ignored.closed_ports[0].port, 22);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_port_scan_runs_under_sh_and_fish_login_shells() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct StubDir(std::path::PathBuf);
+        impl Drop for StubDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let stub_dir = StubDir(
+            std::env::temp_dir().join(format!("oxide-forwarding-fish-stub-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&stub_dir.0);
+        std::fs::create_dir_all(&stub_dir.0).unwrap();
+
+        let ss_stub = stub_dir.0.join("ss");
+        std::fs::write(
+            &ss_stub,
+            "#!/bin/sh\n\
+             printf '%s\\n' 'State Recv-Q Send-Q Local Address:Port Peer Address:Port Process'\n\
+             printf '%s\\n' 'LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:((\"node\",pid=1234,fd=3))'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ss_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let docker_stub = stub_dir.0.join("docker");
+        std::fs::write(
+            &docker_stub,
+            "#!/bin/sh\n\
+             printf 'abc123def456\\tweb\\t0.0.0.0:3000->3000/tcp\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = format!(
+            "{}:{}",
+            stub_dir.0.display(),
+            std::env::var_os("PATH")
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        let env_wrapped = format!("env LANG=C {PORT_SCAN_COMMAND_LINUX}");
+
+        for command in [PORT_SCAN_COMMAND_LINUX, env_wrapped.as_str()] {
+            for shell in ["/bin/sh", "fish"] {
+                let mut process = std::process::Command::new(shell);
+                if shell == "fish" {
+                    process.arg("--no-config");
+                }
+                let output = match process.args(["-c", command]).env("PATH", &path).output() {
+                    Err(error)
+                        if shell == "fish" && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        continue;
+                    }
+                    result => result.unwrap(),
+                };
+                assert!(
+                    output.status.success(),
+                    "{shell}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                assert!(stdout.contains("===END==="), "{shell}: {stdout}");
+                let ports = parse_listening_ports(&stdout, RemotePortScanPlatform::Linux);
+                assert!(
+                    ports.iter().any(|port| port.port == 8080
+                        && port.process_name.as_deref() == Some("node")
+                        && port.pid == Some(1234)),
+                    "{shell}: {ports:?}"
+                );
+                assert!(
+                    ports.iter().any(|port| port.port == 3000
+                        && port.process_name.as_deref() == Some("docker:web")),
+                    "{shell}: {ports:?}"
+                );
+            }
+        }
     }
 }

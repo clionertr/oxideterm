@@ -4,7 +4,7 @@
 use super::model::{ProjectManifestEntry, ProjectProbeError, ProjectProbeOutcome};
 use super::parse::{interpret_project_manifest_entries, project_manifest_file_names};
 use crate::cwd::{CurrentDirectorySource, expand_local_home_path};
-use crate::shell::shell_quote;
+use crate::shell::{encoded_posix_shell_command, shell_quote};
 
 pub const PROJECT_SHELL_PROBE_SENTINEL: &str = "OXIDETERM_PROJECT_PROBE_V1";
 pub const PROJECT_PROBE_MAX_ANCESTORS: usize = 12;
@@ -41,11 +41,11 @@ pub fn remote_project_cwd_source_is_trusted(source: CurrentDirectorySource) -> b
 
 /// Build the POSIX shell command used by SSH node exec probes.
 pub fn remote_shell_project_probe_command(cwd: &str) -> String {
-    format!(
+    encoded_posix_shell_command(&format!(
         "{}{}",
         remote_project_probe_cd_prelude(cwd),
         remote_project_probe_body()
-    )
+    ))
 }
 
 /// Interpret the NUL-delimited output from `remote_shell_project_probe_command`.
@@ -192,12 +192,71 @@ mod tests {
 
     #[test]
     fn remote_project_probe_quotes_cwd_and_uses_manifest_names() {
-        let command = remote_shell_project_probe_command("~/Project Dir");
+        let command = crate::shell::decoded_posix_script(&remote_shell_project_probe_command(
+            "~/Project Dir",
+        ));
         assert!(command.contains("cd -- \"$HOME\"/'Project Dir'"));
         assert!(command.contains(PROJECT_SHELL_PROBE_SENTINEL));
         assert!(command.contains("'package.json'"));
         assert!(command.contains("'Cargo.toml'"));
         assert!(command.contains("head -c 65536"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_project_probe_runs_under_sh_and_fish_login_shells() {
+        struct TempRoot(std::path::PathBuf);
+        impl Drop for TempRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = TempRoot(temporary_directory("project-fish-probe"));
+        let _ = std::fs::remove_dir_all(&root.0);
+        let project = root.0.join(r"nested it's \project");
+        let child = project.join("src");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        let expected_root = std::fs::canonicalize(&project)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let child_cwd = std::fs::canonicalize(&child)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let command = remote_shell_project_probe_command(&child_cwd);
+
+        for shell in ["/bin/sh", "fish"] {
+            let mut process = std::process::Command::new(shell);
+            if shell == "fish" {
+                process.arg("--no-config");
+            }
+            let output = match process.args(["-c", &command]).output() {
+                Err(error) if shell == "fish" && error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                result => result.unwrap(),
+            };
+            assert!(
+                output.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let ProjectProbeOutcome::Ready(snapshot) =
+                parse_remote_shell_project_probe_output(&stdout)
+            else {
+                panic!("{shell}: unexpected project probe output: {stdout:?}");
+            };
+            assert_eq!(snapshot.root_path(), expected_root, "{shell}");
+            assert_eq!(snapshot.display_label(), "Node", "{shell}");
+        }
     }
 
     #[test]

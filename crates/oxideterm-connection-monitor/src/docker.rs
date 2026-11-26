@@ -312,16 +312,15 @@ pub fn build_docker_follow_logs_command(container_id: &str) -> Result<String, St
 }
 
 fn build_docker_cli_command(os_type: &str, operation: &str, container_id: &str) -> String {
-    let command = match os_type {
+    match os_type {
         "Windows" | "windows" => format!(
             "powershell -NoProfile -ExecutionPolicy Bypass -Command \"docker {operation} {container_id}\""
         ),
-        _ => format!(
+        _ => crate::shell::posix_shell_command(&format!(
             "{}oxide_docker {operation} {container_id}",
             docker_unix_runner!()
-        ),
-    };
-    command
+        )),
+    }
 }
 
 pub fn docker_action_succeeded(exit_code: Option<i32>) -> bool {
@@ -553,14 +552,40 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    fn write_docker_stub_dir(tag: &str, docker_body: &str, sudo_body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("oxide-docker-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, body) in [("docker", docker_body), ("sudo", sudo_body)] {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    #[cfg(unix)]
     #[test]
     fn docker_commands_preserve_original_failure_when_sudo_cannot_help() {
-        for error in [
+        for (index, error) in [
             "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
             "permission denied while trying to connect to the Docker daemon socket",
-        ] {
-            let fixture = format!(
-                "docker() {{ printf '%s\\n' '{error}' >&2; return 17; }}; sudo() {{ printf '%s\\n' 'sudo: a password is required' >&2; return 1; }};"
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let stub_dir = write_docker_stub_dir(
+                &format!("preserve-{index}"),
+                &format!("printf '%s\\n' '{error}' >&2; exit 17"),
+                "printf '%s\\n' 'sudo: a password is required' >&2; exit 1",
+            );
+            let path = format!(
+                "{}:{}",
+                stub_dir.display(),
+                std::env::var_os("PATH")
+                    .unwrap_or_default()
+                    .to_string_lossy()
             );
             for (kind, command) in [
                 ("sample", docker_sample_command("Linux").to_string()),
@@ -578,8 +603,8 @@ mod tests {
                 ),
             ] {
                 let output = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(format!("{fixture}\n{command}"))
+                    .args(["-c", &command])
+                    .env("PATH", &path)
                     .output()
                     .unwrap();
                 let stdout = String::from_utf8(output.stdout).unwrap();
@@ -593,13 +618,14 @@ mod tests {
                     "{kind}"
                 );
             }
+            let _ = std::fs::remove_dir_all(&stub_dir);
         }
     }
 
     #[cfg(unix)]
     #[test]
     fn docker_commands_retry_only_permission_errors() {
-        for (error, expected_sudo) in [
+        for (index, (error, expected_sudo)) in [
             (
                 "Cannot connect to the Docker daemon. Is the docker daemon running?",
                 false,
@@ -609,31 +635,98 @@ mod tests {
                 "permission denied while trying to connect to the Docker daemon socket",
                 true,
             ),
-        ] {
-            let fixture = format!(
-                "docker() {{ printf '%s\\n' '{error}' >&2; return 17; }}; sudo() {{ printf '%s\\n' 'sudo succeeded'; }};"
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let stub_dir = write_docker_stub_dir(
+                &format!("retry-{index}"),
+                &format!("printf '%s\\n' '{error}' >&2; exit 17"),
+                "printf '%s\\n' 'sudo succeeded'",
             );
-            for command in [
-                docker_sample_command("Linux").to_string(),
-                build_docker_action_command("Linux", "abc123def456", DockerActionKind::Restart)
-                    .unwrap()
-                    .command,
-                build_docker_logs_command("Linux", "abc123def456")
-                    .unwrap()
-                    .command,
+            let path = format!(
+                "{}:{}",
+                stub_dir.display(),
+                std::env::var_os("PATH")
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+            for (shell, command) in [
+                ("/bin/sh", docker_sample_command("Linux").to_string()),
+                (
+                    "/bin/sh",
+                    crate::build_sample_command_for(
+                        "Linux",
+                        crate::ResourceSamplingConfig {
+                            system: false,
+                            gpu: false,
+                            processes: false,
+                            docker: true,
+                        },
+                    ),
+                ),
+                (
+                    "fish",
+                    crate::build_sample_command_for(
+                        "Linux",
+                        crate::ResourceSamplingConfig {
+                            system: false,
+                            gpu: false,
+                            processes: false,
+                            docker: true,
+                        },
+                    ),
+                ),
+                (
+                    "/bin/sh",
+                    build_docker_action_command("Linux", "abc123def456", DockerActionKind::Restart)
+                        .unwrap()
+                        .command,
+                ),
+                (
+                    "fish",
+                    build_docker_action_command("Linux", "abc123def456", DockerActionKind::Restart)
+                        .unwrap()
+                        .command,
+                ),
+                (
+                    "/bin/sh",
+                    build_docker_logs_command("Linux", "abc123def456")
+                        .unwrap()
+                        .command,
+                ),
+                (
+                    "fish",
+                    build_docker_logs_command("Linux", "abc123def456")
+                        .unwrap()
+                        .command,
+                ),
             ] {
-                let output = std::process::Command::new("sh")
-                    .args(["-c", &format!("{fixture}\n{command}")])
-                    .output()
-                    .unwrap();
+                let mut process = std::process::Command::new(shell);
+                if shell == "fish" {
+                    process.arg("--no-config");
+                }
+                let output = match process.args(["-c", &command]).env("PATH", &path).output() {
+                    Err(error)
+                        if shell == "fish" && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        continue;
+                    }
+                    result => result.unwrap(),
+                };
                 let stdout = String::from_utf8(output.stdout).unwrap();
                 assert_eq!(
                     stdout.contains("sudo succeeded"),
                     expected_sudo,
-                    "{error}: {stdout}"
+                    "{shell} {error}: {stdout}"
                 );
-                assert_eq!(stdout.contains(error), !expected_sudo, "{error}: {stdout}");
+                assert_eq!(
+                    stdout.contains(error),
+                    !expected_sudo,
+                    "{shell} {error}: {stdout}"
+                );
             }
+            let _ = std::fs::remove_dir_all(&stub_dir);
         }
     }
 

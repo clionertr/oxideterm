@@ -3,7 +3,10 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-use crate::shell::{posix_shell_command, powershell_quote, shell_quote, windows_encoded_command};
+use crate::shell::{
+    encoded_posix_shell_command, posix_shell_command, powershell_quote, shell_quote,
+    windows_encoded_command,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -206,7 +209,7 @@ pub fn service_sample_command(os_type: &str) -> &'static str {
 pub fn build_service_snapshot_command(os_type: &str) -> ServiceCaptureCommand {
     let (command, capability) = match normalized_service_os(os_type) {
         ServiceOs::LinuxSystemd => (
-            SERVICE_SAMPLE_COMMAND_LINUX_SYSTEMD.to_string(),
+            posix_shell_command(SERVICE_SAMPLE_COMMAND_LINUX_SYSTEMD),
             ServiceCommandCapability::Full,
         ),
         ServiceOs::MacLaunchctl => (
@@ -214,7 +217,7 @@ pub fn build_service_snapshot_command(os_type: &str) -> ServiceCaptureCommand {
             ServiceCommandCapability::Partial,
         ),
         ServiceOs::Bsd => (
-            SERVICE_SAMPLE_COMMAND_BSD.to_string(),
+            posix_shell_command(SERVICE_SAMPLE_COMMAND_BSD),
             ServiceCommandCapability::Partial,
         ),
         ServiceOs::Windows => (
@@ -392,27 +395,27 @@ pub fn build_service_logs_command(
     };
     let (command, capability) = match normalized_service_os(os_type) {
         ServiceOs::LinuxSystemd => (
-            format!(
+            encoded_posix_shell_command(&format!(
                 "journalctl -u {} -n 200 --no-pager 2>&1 || sudo -n journalctl -u {} -n 200 --no-pager",
                 shell_quote(service_id),
                 shell_quote(service_id)
-            ),
+            )),
             ServiceCommandCapability::Full,
         ),
         ServiceOs::MacLaunchctl => (
-            format!(
+            encoded_posix_shell_command(&format!(
                 "log show --last 1h --style compact --predicate {} 2>&1",
                 shell_quote(&format!(
                     "process == \"{service_id}\" OR sender == \"{service_id}\" OR eventMessage CONTAINS \"{service_id}\""
                 ))
-            ),
+            )),
             ServiceCommandCapability::Partial,
         ),
         ServiceOs::Bsd => (
-            format!(
+            encoded_posix_shell_command(&format!(
                 "tail -n 200 /var/log/messages 2>/dev/null | grep -F {} || true",
                 shell_quote(service_id)
-            ),
+            )),
             ServiceCommandCapability::Partial,
         ),
         ServiceOs::Windows => (
@@ -445,23 +448,26 @@ pub fn build_service_follow_logs_command(
     };
     let (command, capability) = match normalized_service_os(os_type) {
         ServiceOs::LinuxSystemd => (
-            format!("journalctl -fu {} --no-pager", shell_quote(service_id)),
+            encoded_posix_shell_command(&format!(
+                "journalctl -fu {} --no-pager",
+                shell_quote(service_id)
+            )),
             ServiceCommandCapability::Full,
         ),
         ServiceOs::MacLaunchctl => (
-            format!(
+            encoded_posix_shell_command(&format!(
                 "log stream --style compact --predicate {}",
                 shell_quote(&format!(
                     "process == \"{service_id}\" OR sender == \"{service_id}\" OR eventMessage CONTAINS \"{service_id}\""
                 ))
-            ),
+            )),
             ServiceCommandCapability::Partial,
         ),
         ServiceOs::Bsd => (
-            format!(
+            encoded_posix_shell_command(&format!(
                 "tail -f /var/log/messages 2>/dev/null | grep --line-buffered -F {}",
                 shell_quote(service_id)
-            ),
+            )),
             ServiceCommandCapability::Partial,
         ),
         ServiceOs::Windows => (
@@ -651,10 +657,10 @@ fn build_systemd_service_action_command(service_id: &str, action: &ServiceAction
     };
     let service = shell_quote(service_id);
     let success = service_action_success_text(service_id, action);
-    format!(
+    encoded_posix_shell_command(&format!(
         "if systemctl {verb} {service} 2>&1 || sudo -n systemctl {verb} {service} 2>&1; then echo {}; else status=$?; echo 'Service action failed' >&2; exit $status; fi",
         shell_quote(&success)
-    )
+    ))
 }
 
 fn build_launchctl_service_action_command(
@@ -676,7 +682,7 @@ fn build_launchctl_service_action_command(
             );
         }
     };
-    Ok(posix_shell_command(&format!(
+    Ok(encoded_posix_shell_command(&format!(
         "launchctl {verb} {}",
         shell_quote(service_id)
     )))
@@ -707,10 +713,10 @@ fn build_bsd_service_action_command(service_id: &str, action: &ServiceActionKind
         ),
     };
     let success = service_action_success_text(service_id, action);
-    format!(
+    encoded_posix_shell_command(&format!(
         "if {operation} 2>&1; then echo {}; else status=$?; echo 'Service action failed' >&2; exit $status; fi",
         shell_quote(&success)
-    )
+    ))
 }
 
 fn build_windows_service_action_command(service_id: &str, action: &ServiceActionKind) -> String {
@@ -886,12 +892,16 @@ mod tests {
     fn unix_snapshot_commands_have_valid_posix_shell_syntax() {
         for os_type in ["Linux", "Darwin", "FreeBSD"] {
             let command = build_service_snapshot_command(os_type);
-            let status = std::process::Command::new("sh")
-                .args(["-n", "-c", &command.command])
-                .status()
-                .expect("run POSIX shell syntax check");
+            assert!(command.command.starts_with("/bin/sh -c "), "{os_type}");
+            let inner = crate::shell::decoded_posix_script(&command.command);
+            for script in [command.command.as_str(), inner.as_str()] {
+                let status = std::process::Command::new("sh")
+                    .args(["-n", "-c", script])
+                    .status()
+                    .expect("run POSIX shell syntax check");
 
-            assert!(status.success(), "{os_type} snapshot command should parse");
+                assert!(status.success(), "{os_type} snapshot command should parse");
+            }
         }
     }
 
@@ -997,7 +1007,10 @@ mod tests {
             build_service_action_command("Linux", "sshd.service", ServiceActionKind::Restart)
                 .unwrap();
         assert_eq!(linux.capability, ServiceCommandCapability::Full);
-        assert!(linux.command.contains("systemctl restart 'sshd.service'"));
+        assert!(
+            crate::shell::decoded_posix_script(&linux.command)
+                .contains("systemctl restart 'sshd.service'")
+        );
 
         let mac = build_service_action_command(
             "macOS",
@@ -1006,7 +1019,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mac.capability, ServiceCommandCapability::Partial);
-        assert!(mac.command.contains("launchctl disable"));
         assert_eq!(
             crate::shell::decoded_posix_script(&mac.command),
             "launchctl disable 'gui/501/com.example.agent'"
@@ -1036,7 +1048,178 @@ mod tests {
         let command = build_service_follow_logs_command("Linux", "sshd.service").unwrap();
 
         assert_eq!(command.capability, ServiceCommandCapability::Full);
-        assert!(command.command.contains("journalctl -fu 'sshd.service'"));
+        assert_eq!(
+            crate::shell::decoded_posix_script(&command.command),
+            "journalctl -fu 'sshd.service' --no-pager"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_commands_execute_with_exact_target_under_sh_and_fish() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct StubDir(std::path::PathBuf);
+        impl Drop for StubDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let stub_dir = StubDir(
+            std::env::temp_dir().join(format!("oxide-service-fish-stub-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&stub_dir.0);
+        std::fs::create_dir_all(&stub_dir.0).unwrap();
+
+        let systemctl_stub = stub_dir.0.join("systemctl");
+        std::fs::write(
+            &systemctl_stub,
+            r#"#!/bin/sh
+if [ "$1" = list-unit-files ]; then
+  printf '%s\n' 'sshd.service enabled'
+  exit 0
+fi
+if [ "$1" = list-units ]; then
+  printf '%s\n' 'sshd.service loaded active running OpenSSH daemon'
+  exit 0
+fi
+if [ "$1" = show ]; then
+  printf '%s\n' 'Id=sshd.service' 'LoadState=loaded' 'ActiveState=active' 'SubState=running' 'UnitFileState=enabled' 'MainPID=42' 'Description=OpenSSH daemon'
+  exit 0
+fi
+printf 'SYSTEMCTL\t%s\t%s\n' "$1" "$2"
+if [ "$SYSTEMCTL_MODE" = fail ]; then
+  exit 7
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&systemctl_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sudo_stub = stub_dir.0.join("sudo");
+        std::fs::write(
+            &sudo_stub,
+            r#"#!/bin/sh
+printf 'SUDO\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4"
+exit 17
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&sudo_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let journalctl_stub = stub_dir.0.join("journalctl");
+        std::fs::write(
+            &journalctl_stub,
+            r#"#!/bin/sh
+printf 'JOURNAL\t%s\t%s\n' "$1" "$2"
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&journalctl_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = format!(
+            "{}:{}",
+            stub_dir.0.display(),
+            std::env::var_os("PATH")
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        let target = r"dev-disk\x2d'test'.service";
+        let snapshot_cmd = build_service_snapshot_command("Linux").command;
+        let action_cmd = build_service_action_command("Linux", target, ServiceActionKind::Restart)
+            .unwrap()
+            .command;
+        let logs_cmd = build_service_logs_command("Linux", target).unwrap().command;
+
+        for shell in ["/bin/sh", "fish"] {
+            let run = |cmd: &str, mode: &str| {
+                let mut process = std::process::Command::new(shell);
+                if shell == "fish" {
+                    process.arg("--no-config");
+                }
+                process
+                    .args(["-c", cmd])
+                    .env("PATH", &path)
+                    .env("SYSTEMCTL_MODE", mode)
+                    .output()
+            };
+
+            let snap_out = match run(&snapshot_cmd, "ok") {
+                Err(error) if shell == "fish" && error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                result => result.unwrap(),
+            };
+            assert!(
+                snap_out.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&snap_out.stderr)
+            );
+            let snapshot = parse_service_snapshot(&String::from_utf8(snap_out.stdout).unwrap());
+            assert_eq!(
+                snapshot.status,
+                ResourceServiceStatus::Available {
+                    capability: ServiceCommandCapability::Full,
+                    platform: "linux_systemd".to_string(),
+                },
+                "{shell}"
+            );
+            assert_eq!(snapshot.services.len(), 1, "{shell}");
+            assert_eq!(snapshot.services[0].id, "sshd.service", "{shell}");
+            assert_eq!(
+                snapshot.services[0].main_pid.as_deref(),
+                Some("42"),
+                "{shell}"
+            );
+
+            let ok_out = run(&action_cmd, "ok").unwrap();
+            assert!(
+                ok_out.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&ok_out.stderr)
+            );
+            let ok_stdout = String::from_utf8(ok_out.stdout).unwrap();
+            assert!(
+                ok_stdout.contains(&format!("SYSTEMCTL\trestart\t{target}")),
+                "{shell}: {ok_stdout}"
+            );
+            assert!(
+                ok_stdout.contains(&format!("Restarted service {target}")),
+                "{shell}: {ok_stdout}"
+            );
+
+            let fail_out = run(&action_cmd, "fail").unwrap();
+            assert_eq!(fail_out.status.code(), Some(17), "{shell}");
+            let fail_stdout = String::from_utf8(fail_out.stdout).unwrap();
+            let fail_stderr = String::from_utf8(fail_out.stderr).unwrap();
+            assert!(
+                fail_stdout.contains(&format!("SYSTEMCTL\trestart\t{target}")),
+                "{shell}: {fail_stdout}"
+            );
+            assert!(
+                fail_stdout.contains(&format!("SUDO\t-n\tsystemctl\trestart\t{target}")),
+                "{shell}: {fail_stdout}"
+            );
+            assert!(
+                fail_stderr.contains("Service action failed"),
+                "{shell}: {fail_stderr}"
+            );
+
+            let logs_out = run(&logs_cmd, "ok").unwrap();
+            assert!(
+                logs_out.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&logs_out.stderr)
+            );
+            let logs_stdout = String::from_utf8(logs_out.stdout).unwrap();
+            assert!(
+                logs_stdout.contains(&format!("JOURNAL\t-u\t{target}")),
+                "{shell}: {logs_stdout}"
+            );
+        }
     }
 
     #[test]

@@ -27,8 +27,6 @@ const PROFILER_CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const PROFILER_SAMPLE_TIMEOUT: Duration = Duration::from_secs(PORT_SCAN_TIMEOUT_SECS);
 const PROFILER_END_MARKER: &str = "===END===";
 const PROFILER_MAX_CONSECUTIVE_FAILURES: u32 = 3;
-const PROFILER_INIT_UNIX: &str =
-    "export PS1=''; export PS2=''; stty -echo 2>/dev/null; export LANG=C\n";
 const PROFILER_INIT_WINDOWS: &str = "set PROMPT=\r\n";
 
 #[derive(Debug)]
@@ -215,18 +213,18 @@ async fn profiler_loop(
             return;
         }
     };
-    let command = format!("{}\n", platform.scan_command());
-    let init_command = match platform {
-        RemotePortScanPlatform::Windows => PROFILER_INIT_WINDOWS,
-        _ => PROFILER_INIT_UNIX,
-    };
-    let mut shell = match open_profiler_shell(&ssh_connection, init_command).await {
-        Ok(shell) => shell,
-        Err(error) => {
-            tracing::warn!("failed to start port detection profiler {connection_id}: {error}");
-            lifecycle.store(ProfilerLifecycle::Degraded.as_u8(), Ordering::Release);
-            return;
-        }
+    // Fish buffers a non-PTY shell's input until EOF. Use SSH exec for each Unix sample.
+    let (command, mut windows_shell) = match platform {
+        RemotePortScanPlatform::Windows => match open_windows_profiler_shell(&ssh_connection).await
+        {
+            Ok(shell) => (format!("{}\n", platform.scan_command()), Some(shell)),
+            Err(error) => {
+                tracing::warn!("failed to start port detection profiler {connection_id}: {error}");
+                lifecycle.store(ProfilerLifecycle::Degraded.as_u8(), Ordering::Release);
+                return;
+            }
+        },
+        _ => (format!("env LANG=C {}", platform.scan_command()), None),
     };
 
     let mut previous_ports = HashSet::new();
@@ -247,10 +245,11 @@ async fn profiler_loop(
                     tracing::warn!("port detection profiler degraded for {connection_id} after {consecutive_failures} consecutive failures");
                     continue;
                 }
-                let output = match shell
-                    .sample_until(&command, PROFILER_END_MARKER, PROFILER_SAMPLE_TIMEOUT, PORT_SCAN_MAX_OUTPUT_SIZE)
-                    .await
-                {
+                let sample = match windows_shell.as_mut() {
+                    Some(shell) => shell.sample_until(&command, PROFILER_END_MARKER, PROFILER_SAMPLE_TIMEOUT, PORT_SCAN_MAX_OUTPUT_SIZE).await,
+                    None => ssh_connection.run_command(&command, PROFILER_SAMPLE_TIMEOUT, PORT_SCAN_MAX_OUTPUT_SIZE).await,
+                };
+                let output = match sample {
                     Ok(output) => {
                         consecutive_failures = 0;
                         lifecycle.store(ProfilerLifecycle::Running.as_u8(), Ordering::Release);
@@ -261,11 +260,13 @@ async fn profiler_loop(
                         tracing::warn!(
                             "port detection profiler sample failed for {connection_id} ({consecutive_failures}/{PROFILER_MAX_CONSECUTIVE_FAILURES}): {error}"
                         );
-                        if let Ok(new_shell) = open_profiler_shell(&ssh_connection, init_command)
-                            .await
+                        if windows_shell.is_some()
+                            && let Ok(new_shell) = open_windows_profiler_shell(&ssh_connection).await
                         {
-                            shell = new_shell;
-                            tracing::debug!("port detection profiler reopened shell channel for {connection_id}");
+                            windows_shell = Some(new_shell);
+                            tracing::debug!(
+                                "port detection profiler reopened shell channel for {connection_id}"
+                            );
                         }
                         continue;
                     }
@@ -329,17 +330,18 @@ async fn profiler_loop(
             }
         }
     }
-    let _ = shell.close().await;
+    if let Some(mut shell) = windows_shell {
+        let _ = shell.close().await;
+    }
     lifecycle.store(ProfilerLifecycle::Stopped.as_u8(), Ordering::Release);
 }
 
-async fn open_profiler_shell(
+async fn open_windows_profiler_shell(
     ssh_connection: &SshConnectionHandle,
-    init_command: &str,
 ) -> Result<oxideterm_ssh::SshShellChannel, oxideterm_ssh::SshTransportError> {
     tokio::time::timeout(
         PROFILER_CHANNEL_OPEN_TIMEOUT,
-        ssh_connection.open_persistent_shell_channel(init_command),
+        ssh_connection.open_persistent_shell_channel(PROFILER_INIT_WINDOWS),
     )
     .await
     .map_err(|_| oxideterm_ssh::SshTransportError::Timeout)?

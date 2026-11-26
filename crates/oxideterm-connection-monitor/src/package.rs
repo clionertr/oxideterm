@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-use crate::shell::{posix_shell_command, shell_quote};
+use crate::shell::{encoded_posix_shell_command, posix_shell_command, shell_quote};
 
 mod homebrew;
 
@@ -216,24 +216,32 @@ pub fn build_package_inspect_command(
             if package_name.starts_with("brew:") {
                 homebrew::action_command("info", package_name)?
             } else {
-                format!("HOMEBREW_NO_AUTO_UPDATE=1 brew info -- {quoted}")
+                encoded_posix_shell_command(&format!(
+                    "HOMEBREW_NO_AUTO_UPDATE=1 brew info -- {quoted}"
+                ))
             },
             PackageCommandCapability::Partial,
         ),
         (PackageOs::Linux | PackageOs::Unknown, "apt") => (
-            format!("apt show {quoted} 2>/dev/null || dpkg -s {quoted}"),
+            encoded_posix_shell_command(&format!(
+                "apt show {quoted} 2>/dev/null || dpkg -s {quoted}"
+            )),
             PackageCommandCapability::Partial,
         ),
         (PackageOs::Linux | PackageOs::Unknown, "dnf") => (
-            format!("dnf --cacheonly info {quoted} || rpm -qi {quoted}"),
+            encoded_posix_shell_command(&format!(
+                "dnf --cacheonly info {quoted} || rpm -qi {quoted}"
+            )),
             PackageCommandCapability::Partial,
         ),
         (PackageOs::Linux | PackageOs::Unknown, "yum") => (
-            format!("yum --cacheonly info {quoted} || rpm -qi {quoted}"),
+            encoded_posix_shell_command(&format!(
+                "yum --cacheonly info {quoted} || rpm -qi {quoted}"
+            )),
             PackageCommandCapability::Partial,
         ),
         (PackageOs::Linux | PackageOs::Unknown, "pacman") => (
-            format!("pacman -Qi {quoted}"),
+            encoded_posix_shell_command(&format!("pacman -Qi {quoted}")),
             PackageCommandCapability::Partial,
         ),
         (PackageOs::Windows, "winget") => (
@@ -447,7 +455,7 @@ fn build_linux_package_snapshot_command() -> String {
     // Package snapshots share the user's SSH connection with terminals. Keep
     // them to manager detection plus cached/upgradable rows; full inventories
     // and service-owner mapping are explicit inspect/diagnostic work.
-    concat!(
+    posix_shell_command(concat!(
         "echo '===PACKAGES==='; ",
         "echo '__OXIDE_PACKAGE_CAPABILITY__\tpartial\tlinux_packages'; ",
         "oxide_pkg_any=0; ",
@@ -461,7 +469,9 @@ fn build_linux_package_snapshot_command() -> String {
         // dnf4 exits 100 when updates are listed and dnf5 exits 0; any other
         // status is a real failure (for example an empty cache-only metadata
         // store) that must reach the UI instead of looking like zero packages.
-        "if [ \"$oxide_rpm_status\" -eq 0 ] || [ \"$oxide_rpm_status\" -eq 100 ]; then printf '%s\\n' \"$oxide_rpm_out\" | awk -v manager=\"$oxide_rpm_manager\" 'NF>=3 && $1 !~ /^(Last|Obsoleting|Security:)/ { arch=$1; sub(/^.*\\./,\"\",arch); name=$1; sub(\"\\\\.\" arch \"$\",\"\",name); printf \"ROW\\t%s\\t%s\\t\\t%s\\t%s\\t%s\\tupgradable\\t\\t\\t\\t%s\\n\", name, manager, $2, arch, $3, manager }'; ",
+        // Use `[.]` instead of `\\.` so Fish never collapses double backslashes
+        // inside the outer single-quoted /bin/sh -c argument.
+        "if [ \"$oxide_rpm_status\" -eq 0 ] || [ \"$oxide_rpm_status\" -eq 100 ]; then printf '%s\\n' \"$oxide_rpm_out\" | awk -v manager=\"$oxide_rpm_manager\" 'NF>=3 && $1 !~ /^(Last|Obsoleting|Security:)/ { arch=$1; sub(/^.*\\./,\"\",arch); name=$1; sub(\"[.]\" arch \"$\",\"\",name); printf \"ROW\\t%s\\t%s\\t\\t%s\\t%s\\t%s\\tupgradable\\t\\t\\t\\t%s\\n\", name, manager, $2, arch, $3, manager }'; ",
         "else printf '__OXIDE_PACKAGE_ERROR__\\t%s\\n' \"$(printf '%s' \"$oxide_rpm_out\" | head -n 1 | tr '\\t' ' ')\"; fi; ",
         "fi; ",
         "if command -v pacman >/dev/null 2>&1; then oxide_pkg_any=1; echo 'MANAGER\tpacman\ttrue\tpacman'; ",
@@ -469,8 +479,7 @@ fn build_linux_package_snapshot_command() -> String {
         "fi; ",
         "if [ \"$oxide_pkg_any\" -eq 0 ]; then echo '__OXIDE_PACKAGE_UNAVAILABLE__'; fi; ",
         "echo '===PACKAGES_END==='"
-    )
-    .to_string()
+    ))
 }
 
 fn build_macos_package_snapshot_command() -> String {
@@ -480,7 +489,7 @@ fn build_macos_package_snapshot_command() -> String {
 fn build_bsd_package_snapshot_command() -> String {
     // Keep BSD package snapshots to update checks. Full pkg query output can be
     // large over SSH and should be requested explicitly later.
-    concat!(
+    posix_shell_command(concat!(
         "echo '===PACKAGES==='; ",
         "if command -v pkg >/dev/null 2>&1; then ",
         "echo '__OXIDE_PACKAGE_CAPABILITY__\tpartial\tbsd_pkg'; ",
@@ -488,8 +497,7 @@ fn build_bsd_package_snapshot_command() -> String {
         "pkg version -v 2>/dev/null | awk 'NF>=3 && $2 ~ /[<>]/ { printf \"ROW\\t%s\\tpkg\\t%s\\t\\t\\t\\tupgradable\\t\\t\\t\\tpkg\\n\", $1, $3 }'; ",
         "else echo '__OXIDE_PACKAGE_UNAVAILABLE__'; fi; ",
         "echo '===PACKAGES_END==='"
-    )
-    .to_string()
+    ))
 }
 
 fn build_windows_package_snapshot_command() -> String {
@@ -961,33 +969,33 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rpm_check_update_failures_are_reported_instead_of_zero_rows() {
+        use std::os::unix::fs::PermissionsExt;
+        let stub_dir = std::env::temp_dir().join(format!("oxide-pkg-stub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&stub_dir);
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        let rpm_stub = stub_dir.join("rpm");
+        std::fs::write(&rpm_stub, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&rpm_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dnf_stub = stub_dir.join("dnf");
+        std::fs::write(
+            &dnf_stub,
+            "#!/bin/sh\n\
+             if [ \"$DNF_MODE\" = updates ]; then \
+             printf '%s\\n' 'Last metadata expiration check: 0:00:01 ago' \
+             'kernel.x86_64 5.14.0-427.el9 rhel9-baseos'; exit 100; fi\n\
+             if [ \"$DNF_MODE\" = empty ]; then exit 0; fi\n\
+             echo 'Cache-only enabled but no cache for repo baseos' >&2; exit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&dnf_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            stub_dir.display(),
+            std::env::var_os("PATH")
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
         let command = build_package_snapshot_command("Linux");
-        let fixture = "rpm() { return 0; }; dnf() { \
-            if [ \"$DNF_MODE\" = updates ]; then \
-            printf '%s\\n' 'Last metadata expiration check: 0:00:01 ago' \
-            'kernel.x86_64 5.14.0-427.el9 rhel9-baseos'; return 100; fi; \
-            if [ \"$DNF_MODE\" = empty ]; then return 0; fi; \
-            echo 'Cache-only enabled but no cache for repo baseos' >&2; return 1; \
-        }; ";
-        let run = |mode: &str| {
-            let output = std::process::Command::new("sh")
-                .args(["-c", &format!("{fixture}{}", command.command)])
-                .env("DNF_MODE", mode)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{mode}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            parse_package_snapshot(&String::from_utf8(output.stdout).unwrap())
-        };
-
-        let updates = run("updates");
-        assert!(matches!(
-            updates.status,
-            ResourcePackageStatus::Available { .. }
-        ));
         // The generated command also probes the host's real apt/pacman, so
         // only the fixture's dnf rows are asserted.
         fn dnf_rows(snapshot: &ResourcePackageSnapshot) -> Vec<(&str, &str, &str, &str, &str)> {
@@ -1006,40 +1014,82 @@ mod tests {
                 })
                 .collect()
         }
-        assert_eq!(
-            dnf_rows(&updates),
-            [(
-                "kernel",
-                "5.14.0-427.el9",
-                "x86_64",
-                "rhel9-baseos",
-                "upgradable"
-            )]
-        );
 
-        let empty = run("empty");
-        assert!(matches!(
-            empty.status,
-            ResourcePackageStatus::Available { .. }
-        ));
-        assert_eq!(
-            empty
-                .managers
-                .iter()
-                .filter(|manager| manager.name == "dnf")
-                .map(|manager| manager.name.as_str())
-                .collect::<Vec<_>>(),
-            ["dnf"]
-        );
-        assert!(dnf_rows(&empty).is_empty());
+        for shell in ["/bin/sh", "fish"] {
+            let run = |mode: &str| {
+                let mut process = std::process::Command::new(shell);
+                if shell == "fish" {
+                    process.arg("--no-config");
+                }
+                let output = match process
+                    .args(["-c", &command.command])
+                    .env("PATH", &path)
+                    .env("DNF_MODE", mode)
+                    .output()
+                {
+                    Err(error)
+                        if shell == "fish" && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return None;
+                    }
+                    result => result.unwrap(),
+                };
+                assert!(
+                    output.status.success(),
+                    "{shell} {mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Some(parse_package_snapshot(
+                    &String::from_utf8(output.stdout).unwrap(),
+                ))
+            };
 
-        let failed = run("failed");
-        assert_eq!(
-            failed.status,
-            ResourcePackageStatus::Error {
-                message: "Cache-only enabled but no cache for repo baseos".to_string()
-            }
-        );
+            let Some(updates) = run("updates") else {
+                continue;
+            };
+            assert!(
+                matches!(updates.status, ResourcePackageStatus::Available { .. }),
+                "{shell}"
+            );
+            assert_eq!(
+                dnf_rows(&updates),
+                [(
+                    "kernel",
+                    "5.14.0-427.el9",
+                    "x86_64",
+                    "rhel9-baseos",
+                    "upgradable"
+                )],
+                "{shell}"
+            );
+
+            let empty = run("empty").unwrap();
+            assert!(
+                matches!(empty.status, ResourcePackageStatus::Available { .. }),
+                "{shell}"
+            );
+            assert_eq!(
+                empty
+                    .managers
+                    .iter()
+                    .filter(|manager| manager.name == "dnf")
+                    .map(|manager| manager.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["dnf"],
+                "{shell}"
+            );
+            assert!(dnf_rows(&empty).is_empty(), "{shell}");
+
+            let failed = run("failed").unwrap();
+            assert_eq!(
+                failed.status,
+                ResourcePackageStatus::Error {
+                    message: "Cache-only enabled but no cache for repo baseos".to_string()
+                },
+                "{shell}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&stub_dir);
     }
 
     #[test]
@@ -1162,8 +1212,11 @@ mod tests {
         let winget =
             build_package_inspect_command("Windows", "winget", "Microsoft.PowerShell").unwrap();
 
-        assert!(apt.command.contains("'weird'\"'\"'name'"));
-        assert!(brew.command.contains("HOMEBREW_NO_AUTO_UPDATE=1 brew info"));
+        assert!(crate::shell::decoded_posix_script(&apt.command).contains("'weird'\"'\"'name'"));
+        assert!(
+            crate::shell::decoded_posix_script(&brew.command)
+                .contains("HOMEBREW_NO_AUTO_UPDATE=1 brew info")
+        );
         assert_eq!(
             winget.command,
             "winget show \"Microsoft.PowerShell\" --accept-source-agreements"
